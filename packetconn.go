@@ -178,30 +178,6 @@ func releaseNftRules(key string) {
 	// Keep the rule alive until Cleanup() is called to avoid rule gap and races.
 }
 
-// refreshRuleHandles re-queries rules from the kernel to populate Handle fields.
-// After AddRule + Flush, the kernel assigns handles but the library's in-memory
-// Rule objects don't have them set. We must query and match to get the handles,
-// otherwise DelRule will silently fail.
-func refreshRuleHandles(conn *FakeTCPPacketConn) {
-	rules, err := nftGlobalConn.GetRules(nftGlobalTable, nftGlobalChain)
-	if err != nil {
-		return
-	}
-	for _, r := range rules {
-		if conn.nftRule4 != nil && conn.nftRule4.Handle == 0 {
-			// Match by comparing expression count (best effort for single-instance)
-			if len(r.Exprs) == len(conn.nftRule4.Exprs) && isIPv4Rule(r) {
-				conn.nftRule4.Handle = r.Handle
-			}
-		}
-		if conn.nftRule6 != nil && conn.nftRule6.Handle == 0 {
-			if len(r.Exprs) == len(conn.nftRule6.Exprs) && !isIPv4Rule(r) {
-				conn.nftRule6.Handle = r.Handle
-			}
-		}
-	}
-}
-
 // isIPv4Rule checks if the rule matches NFPROTO_IPV4 (first Cmp expression)
 func isIPv4Rule(r *nftables.Rule) bool {
 	for _, e := range r.Exprs {
