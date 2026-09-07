@@ -11,6 +11,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"os/signal"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -57,7 +58,17 @@ var (
 	nftGlobalTable *nftables.Table
 	nftGlobalChain *nftables.Chain
 	nftGlobalOnce  sync.Once
+
+	nftRuleMu    sync.Mutex
+	nftRuleMap   = make(map[string]*nftRuleEntry)
+	nftCleanOnce sync.Once
 )
+
+type nftRuleEntry struct {
+	refCount int
+	rule4    *nftables.Rule
+	rule6    *nftables.Rule
+}
 
 func initNftables() {
 	nftGlobalConn = &nftables.Conn{}
@@ -78,6 +89,93 @@ func initNftables() {
 		Priority: nftables.ChainPriorityRef(-1),
 	})
 	_ = nftGlobalConn.Flush()
+
+	go func() {
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
+		<-sig
+		Cleanup()
+	}()
+}
+
+// Cleanup deletes the entire sing-box-faketcp nftables table.
+// It should be called when the program exits.
+func Cleanup() {
+	nftCleanOnce.Do(func() {
+		if nftGlobalConn != nil && nftGlobalTable != nil {
+			nftGlobalConn.DelTable(nftGlobalTable)
+			_ = nftGlobalConn.Flush()
+		}
+	})
+}
+
+// nftRuleKey generates a unique key for the rule registry based on IPs and ports.
+func nftRuleKey(srcIP, dstIP net.IP, srcPort, dstPort uint16) string {
+	return fmt.Sprintf("%s-%s-%d-%d", srcIP.String(), dstIP.String(), srcPort, dstPort)
+}
+
+func acquireNftRules(key string, srcIP, dstIP net.IP, srcPort, dstPort uint16) (rule4, rule6 *nftables.Rule) {
+	nftRuleMu.Lock()
+	defer nftRuleMu.Unlock()
+
+	entry, exists := nftRuleMap[key]
+	if exists {
+		entry.refCount++
+		return entry.rule4, entry.rule6
+	}
+
+	entry = &nftRuleEntry{refCount: 1}
+
+	nftGlobalOnce.Do(initNftables)
+
+	if srcIP.To4() != nil || dstIP.To4() != nil {
+		entry.rule4 = nftGlobalConn.AddRule(&nftables.Rule{
+			Table: nftGlobalTable,
+			Chain: nftGlobalChain,
+			Exprs: buildDropRuleIPv4(srcIP, dstIP, srcPort, dstPort),
+		})
+	}
+	if srcIP.To16() != nil || dstIP.To16() != nil || (srcIP == nil && dstIP == nil) {
+		entry.rule6 = nftGlobalConn.AddRule(&nftables.Rule{
+			Table: nftGlobalTable,
+			Chain: nftGlobalChain,
+			Exprs: buildDropRuleIPv6(srcIP, dstIP, srcPort, dstPort),
+		})
+	}
+	_ = nftGlobalConn.Flush()
+
+	// refresh handles for the newly added rules
+	rules, err := nftGlobalConn.GetRules(nftGlobalTable, nftGlobalChain)
+	if err == nil {
+		for _, r := range rules {
+			if entry.rule4 != nil && entry.rule4.Handle == 0 {
+				if len(r.Exprs) == len(entry.rule4.Exprs) && isIPv4Rule(r) {
+					entry.rule4.Handle = r.Handle
+				}
+			}
+			if entry.rule6 != nil && entry.rule6.Handle == 0 {
+				if len(r.Exprs) == len(entry.rule6.Exprs) && !isIPv4Rule(r) {
+					entry.rule6.Handle = r.Handle
+				}
+			}
+		}
+	}
+
+	nftRuleMap[key] = entry
+	return entry.rule4, entry.rule6
+}
+
+func releaseNftRules(key string) {
+	nftRuleMu.Lock()
+	defer nftRuleMu.Unlock()
+
+	entry, exists := nftRuleMap[key]
+	if !exists {
+		return
+	}
+
+	entry.refCount--
+	// Keep the rule alive until Cleanup() is called to avoid rule gap and races.
 }
 
 // refreshRuleHandles re-queries rules from the kernel to populate Handle fields.
@@ -241,6 +339,7 @@ type FakeTCPPacketConn struct {
 	// nftables
 	nftRule4 *nftables.Rule
 	nftRule6 *nftables.Rule
+	nftKey   string
 
 	// deadlines
 	readDeadline  atomic.Value
@@ -296,12 +395,11 @@ func (conn *FakeTCPPacketConn) captureFlow(handle *net.IPConn, port int) {
 		n, addr, err := handle.ReadFromIP(buf)
 		if err != nil {
 			packetPool.Put(poolBuf)
-			conn.logWarn("[faketcp] captureFlow: ReadFromIP error: ", err, " on ", handle.LocalAddr().String())
-			// Check if connection is closing; if not, retry after a short delay
 			select {
 			case <-conn.die:
 				return
 			default:
+				conn.logWarn("[faketcp] captureFlow: ReadFromIP error: ", err, " on ", handle.LocalAddr().String())
 				time.Sleep(100 * time.Millisecond)
 				continue
 			}
@@ -621,15 +719,8 @@ func (conn *FakeTCPPacketConn) Close() error {
 			conn.handles[k].Close()
 		}
 
-		// delete nftables rules
-		if nftGlobalConn != nil {
-			if conn.nftRule4 != nil {
-				_ = nftGlobalConn.DelRule(conn.nftRule4)
-			}
-			if conn.nftRule6 != nil {
-				_ = nftGlobalConn.DelRule(conn.nftRule6)
-			}
-			_ = nftGlobalConn.Flush()
+		if conn.nftKey != "" {
+			releaseNftRules(conn.nftKey)
 		}
 	})
 	return err
@@ -746,7 +837,6 @@ func DialPacket(remoteAddr string, l logger.ContextLogger) (*FakeTCPPacketConn, 
 	conn.SetReadBuffer(4194304)
 	conn.SetWriteBuffer(4194304)
 	go conn.captureFlow(handle, tcpconn.LocalAddr().(*net.TCPAddr).Port)
-	go conn.cleaner()
 
 	// nftables
 	err = setTTL(tcpconn, 1)
@@ -754,23 +844,8 @@ func DialPacket(remoteAddr string, l logger.ContextLogger) (*FakeTCPPacketConn, 
 		return nil, err
 	}
 
-	nftGlobalOnce.Do(initNftables)
-
-	if raddr.IP.To4() != nil {
-		conn.nftRule4 = nftGlobalConn.AddRule(&nftables.Rule{
-			Table: nftGlobalTable,
-			Chain: nftGlobalChain,
-			Exprs: buildDropRuleIPv4(nil, raddr.IP, 0, uint16(raddr.Port)),
-		})
-	} else {
-		conn.nftRule6 = nftGlobalConn.AddRule(&nftables.Rule{
-			Table: nftGlobalTable,
-			Chain: nftGlobalChain,
-			Exprs: buildDropRuleIPv6(nil, raddr.IP, 0, uint16(raddr.Port)),
-		})
-	}
-	_ = nftGlobalConn.Flush()
-	refreshRuleHandles(conn)
+	conn.nftKey = nftRuleKey(nil, raddr.IP, 0, uint16(raddr.Port))
+	conn.nftRule4, conn.nftRule6 = acquireNftRules(conn.nftKey, nil, raddr.IP, 0, uint16(raddr.Port))
 
 	// discard everything
 	go io.Copy(io.Discard, tcpconn)
@@ -889,20 +964,8 @@ func ListenPacket(address string, bindInterface string, l logger.ContextLogger) 
 	// nftables drop packets marked with TTL = 1
 	// TODO: what if nftables is not available, the next hop will send back ICMP Time Exceeded,
 	// is this still an acceptable behavior?
-	nftGlobalOnce.Do(initNftables)
-
-	conn.nftRule4 = nftGlobalConn.AddRule(&nftables.Rule{
-		Table: nftGlobalTable,
-		Chain: nftGlobalChain,
-		Exprs: buildDropRuleIPv4(nil, nil, uint16(laddr.Port), 0),
-	})
-	conn.nftRule6 = nftGlobalConn.AddRule(&nftables.Rule{
-		Table: nftGlobalTable,
-		Chain: nftGlobalChain,
-		Exprs: buildDropRuleIPv6(nil, nil, uint16(laddr.Port), 0),
-	})
-	_ = nftGlobalConn.Flush()
-	refreshRuleHandles(conn)
+	conn.nftKey = nftRuleKey(nil, nil, uint16(laddr.Port), 0)
+	conn.nftRule4, conn.nftRule6 = acquireNftRules(conn.nftKey, nil, nil, uint16(laddr.Port), 0)
 
 	// discard everything in original connection
 	go func() {
