@@ -128,14 +128,17 @@ func acquireNftRules(key string, srcIP, dstIP net.IP, srcPort, dstPort uint16) (
 
 	nftGlobalOnce.Do(initNftables)
 
-	if srcIP.To4() != nil || dstIP.To4() != nil {
+	isIPv4 := func(ip net.IP) bool { return ip != nil && ip.To4() != nil }
+	isIPv6 := func(ip net.IP) bool { return ip != nil && ip.To4() == nil && ip.To16() != nil }
+
+	if isIPv4(srcIP) || isIPv4(dstIP) || (srcIP == nil && dstIP == nil) {
 		entry.rule4 = nftGlobalConn.AddRule(&nftables.Rule{
 			Table: nftGlobalTable,
 			Chain: nftGlobalChain,
 			Exprs: buildDropRuleIPv4(srcIP, dstIP, srcPort, dstPort),
 		})
 	}
-	if srcIP.To16() != nil || dstIP.To16() != nil || (srcIP == nil && dstIP == nil) {
+	if isIPv6(srcIP) || isIPv6(dstIP) || (srcIP == nil && dstIP == nil) {
 		entry.rule6 = nftGlobalConn.AddRule(&nftables.Rule{
 			Table: nftGlobalTable,
 			Chain: nftGlobalChain,
