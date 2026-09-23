@@ -28,22 +28,17 @@ import (
 var (
 	errTimeout   = errors.New("timeout")
 	expire       = time.Minute
-	fakeTCPDebug = os.Getenv("FAKETCP_DEBUG") == "1"
 )
 
 func (conn *FakeTCPPacketConn) logDebug(args ...any) {
-	if fakeTCPDebug {
-		log.Println(args...)
-	} else if conn.logger != nil {
-		conn.logger.DebugContext(context.Background(), args...)
+	if conn.debug && conn.logger != nil {
+		conn.logger.DebugContext(context.Background(), append([]any{"[faketcp] "}, args...)...)
 	}
 }
 
 func (conn *FakeTCPPacketConn) logWarn(args ...any) {
-	if fakeTCPDebug {
-		log.Println(args...)
-	} else if conn.logger != nil {
-		conn.logger.WarnContext(context.Background(), args...)
+	if conn.logger != nil {
+		conn.logger.WarnContext(context.Background(), append([]any{"[faketcp] "}, args...)...)
 	}
 }
 
@@ -279,6 +274,17 @@ type tcpFlow struct {
 	pseudoSum      atomic.Uint32               // Cached pseudo-header checksum
 	pseudoSumReady atomic.Bool                 // Whether pseudoSum has been computed
 	srcIP          atomic.Pointer[net.IP]      // Cached source IP for checksum
+	
+	// statistics
+	txBytes      atomic.Uint64
+	rxBytes      atomic.Uint64
+	txPackets    atomic.Uint64
+	rxPackets    atomic.Uint64
+	dropOrphan   atomic.Uint64
+	dropBuffer   atomic.Uint64
+	dropNoHandle atomic.Uint64
+
+	remoteAddr   string
 }
 
 type flowKey struct {
@@ -295,6 +301,11 @@ func addrToKey(addr *net.TCPAddr) flowKey {
 	return k
 }
 
+func keyToAddr(key flowKey) string {
+	ip := net.IP(key.IP[:])
+	return net.JoinHostPort(ip.String(), fmt.Sprint(key.Port))
+}
+
 // FakeTCPPacketConn defines a TCP-packet oriented connection
 type FakeTCPPacketConn struct {
 	die     chan struct{}
@@ -308,6 +319,7 @@ type FakeTCPPacketConn struct {
 	handles []*net.IPConn
 
 	logger logger.ContextLogger
+	debug  bool
 
 	// packets captured from all related NICs will be delivered to this channel
 	chMessage chan message
@@ -330,11 +342,32 @@ func (conn *FakeTCPPacketConn) getFlow(key flowKey) *tcpFlow {
 		return v.(*tcpFlow)
 	}
 	e := new(tcpFlow)
+	e.remoteAddr = keyToAddr(key)
 	e.ts.Store(time.Now().UnixNano())
 	if actual, loaded := conn.flowTable.LoadOrStore(key, e); loaded {
 		return actual.(*tcpFlow)
 	}
 	return e
+}
+
+func (conn *FakeTCPPacketConn) removeFlow(key flowKey, e *tcpFlow, reason string) {
+	conn.flowTable.Delete(key)
+	if conn.debug && conn.logger != nil {
+		txB := e.txBytes.Load()
+		rxB := e.rxBytes.Load()
+		txP := e.txPackets.Load()
+		rxP := e.rxPackets.Load()
+		dO := e.dropOrphan.Load()
+		dB := e.dropBuffer.Load()
+		dNH := e.dropNoHandle.Load()
+		
+		conn.logger.DebugContext(context.Background(),
+			"[faketcp] flow closed (", reason, ") [", e.remoteAddr, "] ",
+			"Rx: ", rxB, " bytes (", rxP, " pkts), ",
+			"Tx: ", txB, " bytes (", txP, " pkts). ",
+			"Drops: ", dO+dB+dNH, " (Orphan:", dO, ", BufferFull:", dB, ", NoHandle:", dNH, ")",
+		)
+	}
 }
 
 // clean expired flows
@@ -354,7 +387,7 @@ func (conn *FakeTCPPacketConn) cleaner() {
 						setTTL(c, 64)
 						c.Close()
 					}
-					conn.flowTable.Delete(key)
+					conn.removeFlow(key.(flowKey), v, "timeout")
 				}
 				return true
 			})
@@ -407,7 +440,6 @@ func (conn *FakeTCPPacketConn) captureFlow(handle *net.IPConn, port int) {
 		ack := binary.BigEndian.Uint32(buf[8:12])
 		flags := buf[13]
 		isACK := (flags & 0x10) != 0
-		isPSH := (flags & 0x08) != 0
 		isSYN := (flags & 0x02) != 0
 		isFIN := (flags & 0x01) != 0
 
@@ -422,8 +454,8 @@ func (conn *FakeTCPPacketConn) captureFlow(handle *net.IPConn, port int) {
 		// flow maintaince
 		key := addrToKey(&src)
 		e := conn.getFlow(key)
-
-		conn.logDebug("[faketcp] captureFlow: received tcp packet from ", src.String(), " (payload=", payloadLen, " PSH=", isPSH, ")")
+		e.rxPackets.Add(1)
+		e.rxBytes.Add(uint64(n))
 
 		if e.handle.Load() == nil {
 			e.handle.Store(handle)
@@ -447,13 +479,11 @@ func (conn *FakeTCPPacketConn) captureFlow(handle *net.IPConn, port int) {
 					}
 				}
 				if !waited {
-					conn.logDebug("[faketcp] captureFlow: dropping orphan payload from ", src.String(), " (no conn after 500ms)")
+					e.dropOrphan.Add(1)
 					packetPool.Put(poolBuf)
 					continue
 				}
 			}
-
-			conn.logDebug("[faketcp] captureFlow: pushing payload of length ", payloadLen, " to chMessage")
 
 			// Zero-copy slice of the payload
 			pbuf := buf[dataOffset:n]
@@ -468,6 +498,7 @@ func (conn *FakeTCPPacketConn) captureFlow(handle *net.IPConn, port int) {
 			default:
 				// drop packet if buffer is full to avoid blocking captureFlow
 				packetPool.Put(poolBuf)
+				e.dropBuffer.Add(1)
 				dropCount++
 				now := time.Now()
 				if now.Sub(lastDropLog) > time.Second {
@@ -549,12 +580,13 @@ func (conn *FakeTCPPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err erro
 	handle := e.handle.Load()
 
 	if handle == nil {
-		conn.logDebug("[faketcp] WriteTo: dropped len=", len(p), " for ", addr.String(), " (no handle)")
+		e.dropNoHandle.Add(1)
 		n = len(p)
 		return n, nil
 	}
 
-	conn.logDebug("[faketcp] WriteTo: sending len=", len(p), " to ", addr.String())
+	e.txPackets.Add(1)
+	e.txBytes.Add(uint64(len(p)))
 
 	// Manual fast-path TCP serialization (zero allocation, no gopacket)
 	tcpLenInt := 20 + len(p)
@@ -688,7 +720,7 @@ func (conn *FakeTCPPacketConn) Close() error {
 					setTTL(c, 64)
 					c.Close()
 				}
-				conn.flowTable.Delete(key)
+				conn.removeFlow(key.(flowKey), v, "server closed")
 				return true
 			})
 		}
@@ -772,7 +804,7 @@ func (conn *FakeTCPPacketConn) SetWriteBuffer(bytes int) error {
 
 // DialPacket connects to the remote TCP port,
 // and returns a single packet-oriented connection
-func DialPacket(remoteAddr string, l logger.ContextLogger) (*FakeTCPPacketConn, error) {
+func DialPacket(remoteAddr string, l logger.ContextLogger, debug bool) (*FakeTCPPacketConn, error) {
 	raddr, err := net.ResolveTCPAddr("tcp", remoteAddr)
 	if err != nil {
 		return nil, err
@@ -806,6 +838,7 @@ func DialPacket(remoteAddr string, l logger.ContextLogger) (*FakeTCPPacketConn, 
 	conn.die = make(chan struct{})
 	conn.tcpconn = tcpconn
 	conn.logger = l
+	conn.debug = debug
 	conn.chMessage = make(chan message, 65536)
 
 	raddrTCP := tcpconn.RemoteAddr().(*net.TCPAddr)
@@ -835,7 +868,7 @@ func DialPacket(remoteAddr string, l logger.ContextLogger) (*FakeTCPPacketConn, 
 // ListenPacket acts like net.ListenTCP,
 // and returns a single packet-oriented connection.
 // If bindInterface is non-empty, only capture on that network interface.
-func ListenPacket(address string, bindInterface string, l logger.ContextLogger) (*FakeTCPPacketConn, error) {
+func ListenPacket(address string, bindInterface string, l logger.ContextLogger, debug bool) (*FakeTCPPacketConn, error) {
 	addr := M.ParseSocksaddr(address)
 	laddr, err := net.ResolveTCPAddr("tcp", net.JoinHostPort(addr.Addr.String(), fmt.Sprint(addr.Port)))
 	if err != nil {
@@ -846,6 +879,7 @@ func ListenPacket(address string, bindInterface string, l logger.ContextLogger) 
 	conn := new(FakeTCPPacketConn)
 	conn.die = make(chan struct{})
 	conn.logger = l
+	conn.debug = debug
 	conn.chMessage = make(chan message, 65536)
 
 	// AF_INET
@@ -931,9 +965,7 @@ func ListenPacket(address string, bindInterface string, l logger.ContextLogger) 
 	tcpln := lnInterface.(*net.TCPListener)
 
 	conn.listener = tcpln
-	if fakeTCPDebug {
-		log.Println("faketcp server started at ", tcpln.Addr())
-	} else if l != nil {
+	if l != nil {
 		l.Info("faketcp server started at ", tcpln.Addr())
 	}
 
@@ -984,8 +1016,8 @@ type FakeTCPConn struct {
 	logger     logger.ContextLogger
 }
 
-func DialConn(remoteAddr string, l logger.ContextLogger) (*FakeTCPConn, error) {
-	pc, err := DialPacket(remoteAddr, l)
+func DialConn(remoteAddr string, l logger.ContextLogger, debug bool) (*FakeTCPConn, error) {
+	pc, err := DialPacket(remoteAddr, l, debug)
 	if err != nil {
 		return nil, err
 	}

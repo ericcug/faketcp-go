@@ -15,11 +15,11 @@ var errUnsupported = errors.New("faketcp is only supported on linux")
 
 type FakeTCPPacketConn struct{}
 
-func ListenPacket(address string, bindInterface string, l logger.ContextLogger) (*FakeTCPPacketConn, error) {
+func ListenPacket(address string, bindInterface string, l logger.ContextLogger, debug bool) (*FakeTCPPacketConn, error) {
 	return nil, errUnsupported
 }
 
-func DialPacket(remoteAddr string, l logger.ContextLogger) (*FakeTCPPacketConn, error) {
+func DialPacket(remoteAddr string, l logger.ContextLogger, debug bool) (*FakeTCPPacketConn, error) {
 	return nil, errUnsupported
 }
 
@@ -45,7 +45,7 @@ func (c *FakeTCPPacketConn) SyscallConn() (interface{}, error)  { return nil, er
 
 type FakeTCPConn struct{}
 
-func DialConn(remoteAddr string, l logger.ContextLogger) (*FakeTCPConn, error) {
+func DialConn(remoteAddr string, l logger.ContextLogger, debug bool) (*FakeTCPConn, error) {
 	return nil, errUnsupported
 }
 
